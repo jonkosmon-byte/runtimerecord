@@ -1,0 +1,531 @@
+<?php
+/*
+Plugin Name: Runner Time Record
+Description: Record and manage checkpoint & finish times for ultramarathon runners (mobile-friendly frontend & backend admin participants management).
+Version: 1.1
+Author: semarkita & Copilot
+*/
+
+if (!defined('ABSPATH')) exit;
+
+class RunnerTimeRecord {
+    private $option_key = 'rtr_participants';
+    private $race_option = 'rtr_race';
+    private $roles = [
+        'cp1' => 'CP1',
+        'cp2' => 'CP2',
+        'cp3' => 'CP3',
+        'finish' => 'Finish'
+    ];
+    private $checkpoints = ['cp1', 'cp2', 'cp3'];
+    private $columns = [
+        'number' => 'Bib Number',
+        'name' => 'Runner Name',
+        'cp1_in' => 'CP1 In',
+        'cp1_out' => 'CP1 Out',
+        'cp2_in' => 'CP2 In',
+        'cp2_out' => 'CP2 Out',
+        'cp3_in' => 'CP3 In',
+        'cp3_out' => 'CP3 Out',
+        'finish' => 'Finish',
+        'dnf' => 'DNF',
+        'total' => 'Total Time',
+        'finishtime' => 'Finish Time (Local)'
+    ];
+
+    function __construct() {
+        add_action('init', [$this, 'register_roles']);
+        add_action('admin_post_rtr_export_csv', [$this, 'handle_export_csv']);
+        add_shortcode('runner_time_record', [$this, 'shortcode']);
+        add_action('wp_enqueue_scripts', [$this, 'enqueue_assets']);
+        add_action('wp_ajax_rtr_action', [$this, 'handle_action']);
+        add_action('wp_ajax_nopriv_rtr_action', [$this, 'handle_action']);
+        // Backend: menu & page
+        add_action('admin_menu', [$this, 'admin_menu']);
+        add_action('admin_post_rtr_admin_participant', [$this, 'handle_admin_participant']);
+    }
+
+    function register_roles() {
+        foreach ($this->roles as $role => $label) {
+            if (!get_role($role)) {
+                add_role($role, $label, [
+                    'read' => true
+                ]);
+            }
+        }
+    }
+
+    function enqueue_assets() {
+        if (!is_singular()) return;
+        if (has_shortcode(get_post()->post_content, 'runner_time_record')) {
+            wp_enqueue_script('jquery');
+        }
+    }
+
+    function get_participants() {
+        $ps = get_option($this->option_key, []);
+        if (!is_array($ps)) return [];
+        return $ps;
+    }
+
+    function set_participants($ps) {
+        update_option($this->option_key, $ps);
+    }
+
+    function get_race() {
+        $r = get_option($this->race_option, []);
+        return is_array($r) ? $r : [];
+    }
+
+    function set_race($r) {
+        update_option($this->race_option, $r);
+    }
+
+    function is_superadmin() {
+        return current_user_can('administrator');
+    }
+    function user_cp() {
+        foreach ($this->roles as $role => $label) {
+            if (current_user_can($role)) return $role;
+        }
+        return false;
+    }
+    function can_edit_cp($cp_col) {
+        $role = $this->user_cp();
+        if ($role === false) return false;
+        if ($cp_col === 'finish' && $role === 'finish') return true;
+        foreach ($this->checkpoints as $cp) {
+            if ($cp_col === $cp && $role === $cp) return true;
+        }
+        return false;
+    }
+    function get_race_time() {
+        $r = $this->get_race();
+        if (empty($r['start'])) return 0;
+        if (!empty($r['stop'])) {
+            return max(0, $r['stop'] - $r['start']);
+        }
+        return max(0, time() - $r['start']);
+    }
+
+    // ==== BACKEND ADMIN MENU ====
+    function admin_menu() {
+        add_menu_page(
+            'Runner Time Record', 'Runner Time Record', 'manage_options', 'runner-time-record', [$this, 'admin_page'], 'dashicons-groups', 26
+        );
+    }
+    function admin_page() {
+        if (!current_user_can('administrator')) wp_die('Access denied');
+        $ps = $this->get_participants();
+        $msg = '';
+        if (!empty($_GET['msg'])) $msg = esc_html($_GET['msg']);
+        ?>
+        <div class="wrap">
+        <h1>Runner Time Record – Participants</h1>
+        <?php if ($msg): ?>
+            <div style="background:#dff0d8;color:#222;padding:8px 15px;margin-bottom:10px;border-radius:5px;"><?= $msg ?></div>
+        <?php endif; ?>
+        <h2>Add New Runner</h2>
+        <form method="post" action="<?= admin_url('admin-post.php') ?>" style="margin-bottom:18px;">
+            <input type="hidden" name="action" value="rtr_admin_participant">
+            <input type="hidden" name="mode" value="add">
+            <?php wp_nonce_field('rtr_admin_add', 'rtr_admin_nonce'); ?>
+            <input type="number" name="number" min="1" placeholder="Bib Number" required style="width:100px;">
+            <input type="text" name="name" placeholder="Runner Name" maxlength="50" required style="width:220px;">
+            <button type="submit" class="button button-primary">Add Runner</button>
+        </form>
+        <h2>Participants List</h2>
+        <table class="widefat striped" style="max-width:520px;">
+            <thead>
+                <tr>
+                    <th>Bib Number</th>
+                    <th>Runner Name</th>
+                    <th>Action</th>
+                </tr>
+            </thead>
+            <tbody>
+            <?php if (!$ps): ?>
+                <tr><td colspan="3" style="text-align:center;">No participant yet.</td></tr>
+            <?php else: foreach ($ps as $i => $row): ?>
+                <tr>
+                    <td><?= esc_html($row['number']) ?></td>
+                    <td><?= esc_html($row['name']) ?></td>
+                    <td>
+                        <form method="post" action="<?= admin_url('admin-post.php') ?>" style="display:inline;">
+                            <input type="hidden" name="action" value="rtr_admin_participant">
+                            <input type="hidden" name="mode" value="delete">
+                            <input type="hidden" name="id" value="<?= $i ?>">
+                            <?php wp_nonce_field('rtr_admin_delete_'.$i, 'rtr_admin_nonce'); ?>
+                            <button type="submit" class="button button-danger" onclick="return confirm('Delete this runner?')">Delete</button>
+                        </form>
+                    </td>
+                </tr>
+            <?php endforeach; endif; ?>
+            </tbody>
+        </table>
+        <p style="color:#666;margin-top:1em;">* All changes here will reflect on the frontend [runner_time_record] table.</p>
+        </div>
+        <?php
+    }
+    function handle_admin_participant() {
+        if (!current_user_can('administrator')) wp_die('Access denied');
+        $mode = $_POST['mode'];
+        $ps = $this->get_participants();
+        if ($mode === 'add') {
+            check_admin_referer('rtr_admin_add', 'rtr_admin_nonce');
+            $number = intval($_POST['number']);
+            $name = sanitize_text_field($_POST['name']);
+            foreach ($ps as $row) if ($row['number']==$number) {
+                wp_redirect(admin_url('admin.php?page=runner-time-record&msg=' . urlencode('Bib number already exists!')));
+                exit;
+            }
+            $ps[] = [
+                'number'=>$number,'name'=>$name,
+                'cp1_in'=>null,'cp1_out'=>null,
+                'cp2_in'=>null,'cp2_out'=>null,
+                'cp3_in'=>null,'cp3_out'=>null,
+                'finish'=>null,'dnf'=>null,'finishtime'=>null
+            ];
+            $this->set_participants($ps);
+            wp_redirect(admin_url('admin.php?page=runner-time-record&msg=' . urlencode('Runner added.')));
+            exit;
+        }
+        if ($mode === 'delete') {
+            $id = intval($_POST['id']);
+            check_admin_referer('rtr_admin_delete_'.$id, 'rtr_admin_nonce');
+            if (isset($ps[$id])) {
+                unset($ps[$id]);
+                $this->set_participants(array_values($ps));
+            }
+            wp_redirect(admin_url('admin.php?page=runner-time-record&msg=' . urlencode('Runner deleted.')));
+            exit;
+        }
+        wp_redirect(admin_url('admin.php?page=runner-time-record'));
+        exit;
+    }
+
+    // ==== FRONTEND SHORTCODE ====
+    function shortcode() {
+        ob_start();
+        $participants = $this->get_participants();
+        $race = $this->get_race();
+        $is_super = $this->is_superadmin();
+        $cp_role = $this->user_cp();
+
+        // Buttons for Super Admin
+        if ($is_super) {
+            ?>
+            <div class="rtr-admin-actions">
+                <button id="rtr-start-race" <?= !empty($race['start']) ? 'disabled' : '' ?>>Start Race</button>
+                <button id="rtr-stop-race" <?= (empty($race['start']) || !empty($race['stop'])) ? 'disabled' : '' ?>>Stop Race</button>
+                <button id="rtr-reset-race">Reset Race</button>
+                <form method="post" action="<?= admin_url('admin-post.php') ?>" style="display:inline;">
+                    <input type="hidden" name="action" value="rtr_export_csv">
+                    <button type="submit">Export CSV</button>
+                </form>
+            </div>
+            <?php
+        }
+        // Race Timer
+        ?>
+        <div class="rtr-timer-wrap">
+            <div class="rtr-timer-label">Race Timer:</div>
+            <div class="rtr-timer" id="rtr-timer" data-start="<?= esc_attr($race['start'] ?? 0) ?>" data-stop="<?= esc_attr($race['stop'] ?? 0) ?>"></div>
+        </div>
+        <?php
+
+        // Tabel utama
+        ?>
+        <div class="rtr-table-wrap">
+        <table id="rtr-table">
+            <thead>
+                <tr>
+                    <?php
+                    foreach ($this->columns as $key => $label) {
+                        // Only sortable for certain columns
+                        $sortable = in_array($key, ['cp1_in','cp1_out','cp2_in','cp2_out','cp3_in','cp3_out','finish','total','finishtime']) ? 'sortable' : '';
+                        echo "<th data-col=\"$key\" class=\"$sortable\">$label</th>";
+                    }
+                    if ($is_super) echo '<th>Delete</th>';
+                ?>
+                </tr>
+            </thead>
+            <tbody>
+            <?php foreach ($participants as $id => $row): ?>
+                <tr data-id="<?= esc_attr($id) ?>" class="<?= !empty($row['dnf']) ? 'rtr-dnf' : '' ?>">
+                    <td><?= esc_html($row['number']) ?></td>
+                    <td><?= esc_html($row['name']) ?></td>
+                    <?php
+                    foreach ($this->checkpoints as $cp) {
+                        // CP In
+                        $key_in = "{$cp}_in";
+                        echo "<td>";
+                        echo $row[$key_in]!==null && $row[$key_in]!=='' ? $this->format_race_time($row[$key_in]) : '';
+                        if (($is_super || ($cp_role === $cp && empty($race['stop']) && empty($row['dnf']))) && empty($row[$key_in])) {
+                            echo " <button class=\"rtr-btn rtr-in\" data-col=\"$key_in\">Check In</button>";
+                        }
+                        echo "</td>";
+                        // CP Out
+                        $key_out = "{$cp}_out";
+                        echo "<td>";
+                        echo $row[$key_out]!==null && $row[$key_out]!=='' ? $this->format_race_time($row[$key_out]) : '';
+                        if (($is_super || ($cp_role === $cp && empty($race['stop']) && empty($row['dnf']))) && !empty($row[$key_in]) && empty($row[$key_out])) {
+                            echo " <button class=\"rtr-btn rtr-out\" data-col=\"$key_out\">Check Out</button>";
+                        }
+                        echo "</td>";
+                    }
+                    // Finish
+                    echo "<td>";
+                    echo $row['finish']!==null && $row['finish']!=='' ? $this->format_race_time($row['finish']) : '';
+                    if (($is_super || ($cp_role === 'finish' && empty($race['stop']) && empty($row['dnf']))) && $this->can_mark_finish($row)) {
+                        if (empty($row['finish'])) {
+                            echo " <button class=\"rtr-btn rtr-finish\" data-col=\"finish\">Finish</button>";
+                        }
+                    }
+                    echo "</td>";
+                    // DNF
+                    echo '<td>';
+                    if (!empty($row['dnf'])) {
+                        echo '✔️';
+                    } else if (($is_super || $cp_role) && empty($race['stop']) && empty($row['finish'])) {
+                        echo '<button class="rtr-btn rtr-dnf" data-col="dnf">DNF</button>';
+                    }
+                    echo '</td>';
+                    // Total Time
+                    echo '<td>';
+                    echo $row['finish']!==null && $row['finish']!=='' ? $this->format_total_time($row) : '';
+                    echo '</td>';
+                    // Waktu Finish (server)
+                    echo '<td>';
+                    echo !empty($row['finishtime']) ? esc_html($row['finishtime']) : '';
+                    echo '</td>';
+                    // Delete
+                    if ($is_super) {
+                        echo '<td><button class="rtr-btn rtr-del" title="Delete Runner">Delete</button></td>';
+                    }
+                    ?>
+                </tr>
+            <?php endforeach; ?>
+            </tbody>
+        </table>
+        </div>
+        <div class="rtr-legend">
+            <strong>Legend:</strong> ✔️ = Marked, empty = Not checked. DNF = Did Not Finish.
+        </div>
+        <?php
+        $this->print_script($is_super, $cp_role, $race, wp_create_nonce('rtr_nonce'));
+        $this->print_css();
+        return ob_get_clean();
+    }
+
+    // Format seconds to HH:MM:SS
+    function format_race_time($seconds) {
+        $h = floor($seconds/3600); $m = floor(($seconds%3600)/60); $s = $seconds%60;
+        return sprintf('%02d:%02d:%02d', $h, $m, $s);
+    }
+    // Hitung total waktu dari 0 ke finish
+    function format_total_time($row) {
+        if (!isset($row['finish'])) return '';
+        return $this->format_race_time($row['finish']);
+    }
+    // Hanya bisa finish jika sudah keluar CP3
+    function can_mark_finish($row) {
+        return !empty($row['cp3_out']) && empty($row['finish']) && empty($row['dnf']);
+    }
+
+    // AJAX Handler
+    function handle_action() {
+        check_ajax_referer('rtr_nonce', 'nonce');
+        $type = $_POST['type'] ?? '';
+        if ($type == 'delete_participant' && $this->is_superadmin()) {
+            $id = intval($_POST['id']);
+            $ps = $this->get_participants();
+            if (isset($ps[$id])) unset($ps[$id]);
+            $this->set_participants(array_values($ps));
+            wp_send_json_success();
+        }
+        if ($type == 'race_action' && $this->is_superadmin()) {
+            $action = $_POST['race'];
+            $race = $this->get_race();
+            if ($action == 'start' && empty($race['start'])) {
+                $race['start'] = time();
+                unset($race['stop']);
+            }
+            if ($action == 'stop' && !empty($race['start']) && empty($race['stop'])) {
+                $race['stop'] = time();
+            }
+            if ($action == 'reset') {
+                $race = [];
+                $ps = $this->get_participants();
+                foreach ($ps as &$p) {
+                    foreach (['cp1_in','cp1_out','cp2_in','cp2_out','cp3_in','cp3_out','finish','dnf','finishtime'] as $k)
+                        $p[$k] = null;
+                }
+                $this->set_participants($ps);
+            }
+            $this->set_race($race);
+            wp_send_json_success();
+        }
+        // Mark check-in/out/finish
+        if ($type == 'mark' && ( $this->is_superadmin() || $this->can_edit_cp($_POST['col']) ) ) {
+            $id = intval($_POST['id']);
+            $col = sanitize_text_field($_POST['col']);
+            $race = $this->get_race();
+            if (empty($race['start']) || !empty($race['stop'])) wp_send_json_error('Race not running');
+            $ps = $this->get_participants();
+            if (!isset($ps[$id])) wp_send_json_error('Not found');
+            if ($col == 'dnf') {
+                if (empty($ps[$id]['finish'])) $ps[$id]['dnf'] = 1;
+            } elseif ($col == 'finish') {
+                // Hanya jika sudah CP3 out
+                if (!empty($ps[$id]['cp3_out']) && empty($ps[$id]['finish']) && empty($ps[$id]['dnf'])) {
+                    $ps[$id]['finish'] = $this->get_race_time();
+                    $ps[$id]['finishtime'] = date('Y-m-d H:i:s');
+                }
+            } else {
+                // CPx_in/out
+                if (empty($ps[$id][$col]) && empty($ps[$id]['dnf']) && empty($ps[$id]['finish'])) {
+                    $ps[$id][$col] = $this->get_race_time();
+                }
+            }
+            $this->set_participants($ps);
+            wp_send_json_success();
+        }
+        wp_send_json_error('Unauthorized');
+    }
+
+    function handle_export_csv() {
+        if (!current_user_can('administrator')) wp_die('Unauthorized');
+        $ps = $this->get_participants();
+        $cols = array_keys($this->columns);
+        header('Content-Type: text/csv');
+        header('Content-Disposition: attachment; filename="runner_time_record.csv"');
+        $out = fopen('php://output', 'w');
+        fputcsv($out, array_values($this->columns));
+        foreach ($ps as $row) {
+            $data = [];
+            foreach ($cols as $c) {
+                if (strpos($c, 'in') !== false || strpos($c, 'out') !== false || $c == 'finish' || $c == 'total') {
+                    $data[] = isset($row[$c]) && $row[$c]!==null && $row[$c]!=='' ? $this->format_race_time($row[$c]) : '';
+                } elseif ($c == 'dnf') {
+                    $data[] = !empty($row[$c]) ? 'DNF' : '';
+                } else {
+                    $data[] = isset($row[$c]) ? $row[$c] : '';
+                }
+            }
+            fputcsv($out, $data);
+        }
+        fclose($out);
+        exit;
+    }
+
+    function print_script($is_super, $cp_role, $race, $nonce) {
+        ?>
+        <script>
+        jQuery(function($){
+            // Race Timer
+            function formatTime(s) {
+                s = Math.max(0, s|0);
+                var h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
+                return ('0'+h).slice(-2)+':'+('0'+m).slice(-2)+':'+('0'+sec).slice(-2);
+            }
+            function updateTimer() {
+                var start = parseInt($('#rtr-timer').data('start')), stop = parseInt($('#rtr-timer').data('stop')), now = Math.floor(Date.now()/1000);
+                var t = start ? (stop ? stop-start : now-start) : 0;
+                $('#rtr-timer').text(formatTime(t));
+            }
+            setInterval(updateTimer, 1000); updateTimer();
+
+            // Sort table
+            $('#rtr-table th.sortable').click(function(){
+                var col = $(this).data('col');
+                var rows = $('#rtr-table tbody tr').get();
+                var sortByTime = function(v) {
+                    if(!v) return 999999;
+                    var parts = v.split(':'), t=0;
+                    if(parts.length==3) t = (+parts[0])*3600+(+parts[1])*60+(+parts[2]);
+                    return t;
+                };
+                rows.sort(function(a,b){
+                    var A = $('td',a).eq($(this).index()).text();
+                    var B = $('td',b).eq($(this).index()).text();
+                    return sortByTime(A)-sortByTime(B);
+                }.bind(this));
+                $.each(rows, function(i, row){ $('#rtr-table tbody').append(row); });
+            });
+
+            // Delete participant (frontend)
+            $('.rtr-del').click(function(){
+                if(!confirm('Delete this runner?')) return;
+                var id = $(this).closest('tr').data('id');
+                $.post(ajaxurl, {action:'rtr_action', type:'delete_participant', id:id, nonce:'<?= $nonce ?>'}, function(r){
+                    if(r.success) location.reload(); else alert(r.data||'Error');
+                });
+            });
+
+            // Race actions
+            $('#rtr-start-race').click(function(){
+                if(!confirm('Start race timer?')) return;
+                $.post(ajaxurl, {action:'rtr_action', type:'race_action', race:'start', nonce:'<?= $nonce ?>'}, function(r){
+                    if(r.success) location.reload(); else alert('Error');
+                });
+            });
+            $('#rtr-stop-race').click(function(){
+                if(!confirm('Stop race timer?')) return;
+                $.post(ajaxurl, {action:'rtr_action', type:'race_action', race:'stop', nonce:'<?= $nonce ?>'}, function(r){
+                    if(r.success) location.reload(); else alert('Error');
+                });
+            });
+            $('#rtr-reset-race').click(function(){
+                if(!confirm('Reset ALL race data (except runners)?')) return;
+                $.post(ajaxurl, {action:'rtr_action', type:'race_action', race:'reset', nonce:'<?= $nonce ?>'}, function(r){
+                    if(r.success) location.reload(); else alert('Error');
+                });
+            });
+
+            // Mark/check buttons
+            $('.rtr-btn').click(function(){
+                var $btn = $(this);
+                var col = $btn.data('col'), id = $btn.closest('tr').data('id');
+                if($btn.hasClass('rtr-dnf') && !confirm('Mark runner as DNF?')) return;
+                if($btn.hasClass('rtr-in') && !confirm('Check IN?')) return;
+                if($btn.hasClass('rtr-out') && !confirm('Check OUT?')) return;
+                if($btn.hasClass('rtr-finish') && !confirm('Mark as FINISH?')) return;
+                $.post(ajaxurl, {action:'rtr_action', type:'mark', id:id, col:col, nonce:'<?= $nonce ?>'}, function(r){
+                    if(r.success) location.reload(); else alert(r.data||'Error');
+                });
+            });
+
+        });
+        </script>
+        <?php
+    }
+
+    function print_css() {
+        ?>
+        <style>
+        /* Mobile-first, simple & clean */
+        .rtr-table-wrap { overflow-x:auto; }
+        #rtr-table { width:100%; border-collapse:collapse; font-size:15px; background:#fff; }
+        #rtr-table th, #rtr-table td { border:1px solid #d0d0d0; padding:0.5em 0.3em; text-align:center; vertical-align:middle; }
+        #rtr-table th { background:#f9f9f9; cursor:pointer; }
+        #rtr-table tr.rtr-dnf { background:#ffe5e5; }
+        .rtr-btn { font-size:13px; padding:3px 10px; margin:2px; background:#2980b9; color:white; border:none; border-radius:4px; cursor:pointer; }
+        .rtr-btn:hover { background:#1a5e8b; }
+        .rtr-admin-actions { margin-bottom:10px; text-align:left; }
+        .rtr-admin-actions button { margin-right:6px; margin-top:4px; }
+        .rtr-timer-wrap { margin:12px 0; display:flex; align-items:center; }
+        .rtr-timer-label { font-weight:bold; margin-right:8px; }
+        .rtr-timer { font-size:1.7em; font-family:monospace; background:#222; color:#f5e900; padding:4px 14px; border-radius:6px; letter-spacing:2px; }
+        .rtr-legend { margin:10px 0 6px 0; font-size:13px; }
+        @media (max-width: 600px) {
+            #rtr-table th, #rtr-table td { font-size:13px; padding:6px 2px; }
+            .rtr-btn { font-size:12px; }
+            .rtr-timer { font-size:1.2em; }
+        }
+        </style>
+        <?php
+    }
+}
+
+new RunnerTimeRecord();
